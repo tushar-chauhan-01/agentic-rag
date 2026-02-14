@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pkill:*)",
+      "Bash(curl:*)",
+      "Bash(source:*)",
+      "Bash(python:*)",
+      "Bash(lsof:*)",
+      "Bash(du:*)",
+      "Bash(streamlit run:*)",
+      "Bash(chmod:*)",
+      "Bash(ls:*)",
+      "Bash(xargs:*)",
+      "Bash(pip install:*)",
+      "Bash(git init:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}

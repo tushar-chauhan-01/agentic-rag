@@ -1,0 +1,44 @@
+# Python virtual environments
+.venv
+venv/
+env/
+
+# Environment variables (CRITICAL - Contains API keys!)
+.env
+.env.local
+.env.*.local
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Database files
+chroma_db/
+*.db
+*.sqlite
+*.sqlite3
+
+# Uploaded documents (may contain sensitive data)
+*.pdf
+temp_upload.pdf
+uploads/
+
+# Editor / OS files
+.vscode/
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Temporary files
+temp/
+tmp/
