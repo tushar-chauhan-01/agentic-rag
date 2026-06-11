@@ -45,11 +45,11 @@ def retrieve_with_scores(query: str, top_k: int = 5) -> List[Tuple[Document, flo
     Retrieve documents with similarity scores.
 
     Returns:
-        List of (Document, score) tuples where score is the similarity score.
-        Higher scores mean more similar/relevant.
+        List of (Document, score) tuples where score is a relevance score
+        normalized to [0, 1]. Higher scores mean more similar/relevant.
     """
     vectorstore = get_vectorstore()
-    results = vectorstore.similarity_search_with_score(query, k=top_k)
+    results = vectorstore.similarity_search_with_relevance_scores(query, k=top_k)
     return results
 
 

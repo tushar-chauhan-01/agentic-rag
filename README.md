@@ -11,6 +11,8 @@ An intelligent document Q&A system powered by **Agentic AI** that uses autonomou
 3. [Understanding AI Types](#-understanding-ai-types)
 4. [Technology Stack](#-technology-stack)
 
+> 📖 **Studying this project?** See **[STUDY_GUIDE.md](STUDY_GUIDE.md)** — a deep-dive into every concept used here (RAG, embeddings, chunking, vector DBs, ReAct agents) with diagrams, senior-engineer edge-case Q&A, and a guide to building & deploying production-ready Agentic RAG systems.
+
 ---
 
 ## 🚀 Quick Start - Run & Stop
@@ -537,10 +539,14 @@ agentic_rag/
 
 ### Default Settings
 
-- Chunk size: 800 tokens
-- Chunk overlap: 150 tokens
+- Chunk size: 800 characters
+- Chunk overlap: 150 characters
 - Max tokens: 4096 (Claude) / 2000 (GPT)
 - Embedding dimensions: 1536
+
+### Retrieval Scores
+
+When "Show Retrieval Scores" is enabled, each retrieved chunk displays a **relevance score normalized to [0, 1]** — higher means more relevant (via Chroma's `similarity_search_with_relevance_scores`).
 
 ---
 
