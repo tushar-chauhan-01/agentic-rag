@@ -186,6 +186,9 @@ Agent Decision:
 - ✅ **Conversation Memory**: Remembers past Q&A for context
 - ✅ **Efficient**: Skips unnecessary retrieval for simple queries
 - ✅ **Transparent**: Can show reasoning steps and retrieval scores
+- ✅ **Evaluated**: Golden-dataset eval harness (`evaluate.py`) measures retrieval recall, answer correctness, and faithfulness
+- ✅ **Guardrailed**: Relevance-threshold guardrail refuses off-topic questions instead of hallucinating
+- ✅ **Multi-document**: Knowledge base holds many PDFs; retrieval is scoped to sidebar-selected documents via metadata filters, with per-document delete and idempotent re-upload
 
 ---
 
@@ -486,7 +489,8 @@ AGENTIC RAG = Autonomous Assistant
 | **Embeddings** | OpenAI text-embedding-ada-002 | Document vectorization |
 | **Vector DB** | ChromaDB | Stores document embeddings |
 | **Agent** | LangGraph ReAct | Autonomous tool orchestration |
-| **Memory** | Python dict | Conversation history |
+| **Memory** | In-process class (per session) | Conversation history |
+| **Evaluation** | `evaluate.py` + golden dataset | Retrieval recall, correctness, faithfulness, refusals |
 
 ### Agent Tools
 
@@ -516,11 +520,13 @@ ChromaDB
 ```
 agentic_rag/
 ├── app.py                 # Streamlit UI (main entry)
-├── agents.py              # LangGraph ReAct agent
+├── agents.py              # LangGraph ReAct agent + retrieval guardrail
 ├── ingestion.py           # PDF → Embeddings → DB
-├── retriever.py           # Vector search
+├── retriever.py           # Vector search (normalized relevance scores)
 ├── memory.py              # Conversation memory
 ├── ingest_wrapper.py      # Subprocess wrapper
+├── evaluate.py            # RAG evaluation harness (retrieval + generation)
+├── golden_dataset.json    # Golden Q&A set for evaluation (BMW X1 guide)
 ├── requirements.txt       # Dependencies
 ├── .env                   # API keys (create this!)
 └── chroma_db/             # Vector database
@@ -529,11 +535,55 @@ agentic_rag/
 
 ---
 
+## 📏 Evaluation & Guardrails
+
+### Evaluation (`evaluate.py`)
+
+The pipeline is measured in two stages against `golden_dataset.json`
+(12 answerable questions from the BMW X1 guide + 5 off-topic questions):
+
+```bash
+# Stage 1 only — retrieval eval (cheap, no LLM calls)
+python evaluate.py
+
+# Full eval — agent correctness + LLM-judged faithfulness + guardrail check
+python evaluate.py --generation
+```
+
+| Stage | Metric | What it catches | Measured (BMW guide) |
+|---|---|---|---|
+| Retrieval | recall@5 | Chunking/embedding failures | **100%** (12/12) |
+| Retrieval | score distributions | Data to calibrate the guardrail threshold | 0.66–0.86 vs 0.60–0.68 |
+| Generation | correctness | Wrong answers (gold-fact substring check) | **100%** (12/12) |
+| Generation | faithfulness | Answers unsupported by retrieved context (LLM-as-judge) | **100%** (12/12) |
+| Generation | refusal rate | Off-topic questions that should be refused | **100%** (5/5) |
+
+Eval models default to `gpt-4o-mini`; override with `EVAL_AGENT_MODEL` / `EVAL_JUDGE_MODEL`.
+
+### Guardrails (`agents.py`)
+
+Two layers prevent hallucination:
+
+1. **Retrieval threshold** — if no retrieved chunk reaches `RELEVANCE_THRESHOLD`
+   (default 0.65, env-overridable), the retriever tool refuses to pass irrelevant
+   context to the LLM. The agent may retry once with different wording, then must
+   tell the user the documents don't contain the answer. The threshold was
+   calibrated with `evaluate.py`: answerable questions scored 0.664–0.858,
+   off-topic 0.597–0.683.
+2. **Document-only system prompt** — the agent must retrieve for every factual
+   question and may never answer from its own knowledge (catches off-topic
+   queries that slip past the threshold).
+
+Try it: ask *"What is the capital of France?"* with the BMW guide loaded — the
+agent responds that the documents don't contain this, instead of saying "Paris".
+
+---
+
 ## 🔧 Configuration
 
 ### Model Settings (Sidebar)
 
-- **Model**: Claude Opus 4.6 / Sonnet 4.5 / GPT-4 / GPT-3.5
+- **Model**: Claude Opus 4.6 / Sonnet 4.5 / GPT-4o-mini / GPT-4 / GPT-3.5
 - **Temperature**: 0.0-1.0 (creativity level)
 - **Top-K**: 1-10 (number of chunks to retrieve)
 

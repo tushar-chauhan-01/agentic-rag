@@ -11,10 +11,16 @@ from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
 from langchain_core.tools import Tool
-from retriever import retrieve_documents_only
+from retriever import retrieve_with_scores
 from memory import ConversationMemory
 from typing import Dict, Any, Optional
 import os
+
+# Retrieval guardrail: if no retrieved chunk reaches this relevance score
+# (0-1, higher = better), the retriever reports "not found" instead of feeding
+# the LLM irrelevant context. Calibrated with evaluate.py on golden_dataset.json
+# (answerable questions scored 0.664-0.858, off-topic 0.597-0.683).
+RELEVANCE_THRESHOLD = float(os.getenv("RELEVANCE_THRESHOLD", "0.65"))
 
 
 class AgenticRAG:
@@ -33,12 +39,22 @@ class AgenticRAG:
         model_name: str = "claude-opus-4-6",
         temperature: float = 0.7,
         top_k: int = 5,
-        verbose: bool = True
+        verbose: bool = True,
+        relevance_threshold: Optional[float] = None,
+        doc_filter: Optional[list] = None
     ):
         self.model_name = model_name
         self.temperature = temperature
         self.top_k = top_k
         self.verbose = verbose
+        self.relevance_threshold = (
+            RELEVANCE_THRESHOLD if relevance_threshold is None
+            else relevance_threshold
+        )
+        self._guardrail_hits = 0
+        self._current_question = None
+        # Restrict retrieval to these document names (None = all documents)
+        self.doc_filter = list(doc_filter) if doc_filter else None
 
         # Initialize LLM based on model provider
         if model_name.startswith("claude"):
@@ -77,14 +93,60 @@ class AgenticRAG:
         def retriever_func(query: str) -> str:
             """Retrieve relevant documents from the knowledge base."""
             try:
-                docs = retrieve_documents_only(query, top_k=self.top_k)
-                if not docs:
+                results = retrieve_with_scores(
+                    query, top_k=self.top_k, doc_names=self.doc_filter
+                )
+                if not results:
                     return "No relevant documents found."
 
-                result_parts = [f"Found {len(docs)} relevant documents:\n"]
-                for i, doc in enumerate(docs, 1):
-                    content_preview = doc.page_content[:300].replace("\n", " ")
-                    result_parts.append(f"\n[Document {i}]\n{content_preview}...")
+                # Guardrail: refuse to pass low-relevance context to the LLM.
+                # Retrieval scores vary with query phrasing, so the FIRST
+                # sub-threshold result invites one reworded retry; the counter
+                # (reset per user question in query()) enforces the limit
+                # deterministically instead of trusting the model to obey.
+                best_score = max(score for _, score in results)
+
+                # The agent rewrites queries before calling this tool, and a
+                # poor rewrite can score below threshold even when the user's
+                # original question retrieves fine. Fall back to the original
+                # phrasing before engaging the guardrail.
+                if (best_score < self.relevance_threshold
+                        and self._current_question
+                        and self._current_question.strip().lower() != query.strip().lower()):
+                    fallback = retrieve_with_scores(
+                        self._current_question, top_k=self.top_k,
+                        doc_names=self.doc_filter
+                    )
+                    if fallback:
+                        fallback_best = max(score for _, score in fallback)
+                        if fallback_best >= self.relevance_threshold:
+                            results, best_score = fallback, fallback_best
+
+                if best_score < self.relevance_threshold:
+                    self._guardrail_hits += 1
+                    if self._guardrail_hits == 1:
+                        return (
+                            f"No sufficiently relevant content found "
+                            f"(best relevance {best_score:.2f}, threshold "
+                            f"{self.relevance_threshold}). Retry document_retriever "
+                            f"ONCE with different wording (e.g. the document's "
+                            f"likely terminology)."
+                        )
+                    return (
+                        f"Still no sufficiently relevant content (best relevance "
+                        f"{best_score:.2f}). STOP retrying. Tell the user the "
+                        f"uploaded documents do not contain this information - "
+                        f"do NOT answer from your own knowledge."
+                    )
+
+                # Full chunk text — truncating here starved the LLM of facts
+                # that sit past the cutoff (chunks are ~800 chars).
+                result_parts = [f"Found {len(results)} relevant documents:\n"]
+                for i, (doc, score) in enumerate(results, 1):
+                    content = doc.page_content.replace("\n", " ")
+                    result_parts.append(
+                        f"\n[Document {i} | relevance {score:.2f}]\n{content}"
+                    )
 
                 return "\n".join(result_parts)
             except Exception as e:
@@ -151,15 +213,16 @@ Summary:"""
         # System message for the agent
         from langchain_core.messages import SystemMessage
 
-        system_message = """You are a helpful AI research assistant with access to a document database.
+        system_message = """You are a research assistant whose ONLY source of facts is the uploaded document database.
 
 Important Instructions:
-- ALWAYS use the document_retriever tool IMMEDIATELY when asked any question about documents
+- ALWAYS use the document_retriever tool IMMEDIATELY for ANY factual question - even if you think you already know the answer
+- NEVER answer factual questions from your own knowledge - facts must come from retrieved documents
+- If document_retriever reports no sufficiently relevant content, tell the user the uploaded documents do not contain this information - do NOT fill in the answer yourself
+- Only skip retrieval for pure conversation (greetings, thanks, chitchat)
 - DO NOT ask permission to search - just search automatically
 - Answer directly from the retrieved documents - DO NOT use the summarizer tool
-- Be concise, direct, and factual
-- If information isn't in the documents, state that clearly
-- Never ask "Would you like me to search?" - always search proactively"""
+- Be concise, direct, and factual"""
 
         # Create the ReAct agent using LangGraph
         agent_executor = create_react_agent(
@@ -188,14 +251,21 @@ Important Instructions:
         if context and context != "No previous conversation.":
             question_with_context = f"Context from previous conversation:\n{context}\n\nCurrent question: {question}"
 
+        # Reset per-question guardrail state
+        self._guardrail_hits = 0
+        self._current_question = question
+
         # Run the agent
         try:
             from langchain_core.messages import HumanMessage
 
-            # Invoke agent with message
-            result = self.agent_executor.invoke({
-                "messages": [HumanMessage(content=question_with_context)]
-            })
+            # Invoke agent with message. recursion_limit bounds the ReAct
+            # loop (~5 tool-call rounds) so a model that keeps retrying
+            # retrieval can't spiral into dozens of API calls.
+            result = self.agent_executor.invoke(
+                {"messages": [HumanMessage(content=question_with_context)]},
+                config={"recursion_limit": 12},
+            )
 
             # Extract answer from messages
             messages = result.get("messages", [])
@@ -207,6 +277,15 @@ Important Instructions:
                     if hasattr(msg, 'content') and msg.content and not isinstance(msg, HumanMessage):
                         answer = msg.content
                         break
+
+            # A recursion-capped run means the agent kept searching without
+            # composing an answer — surface a clean refusal instead of
+            # LangGraph's canned "need more steps" message.
+            if "need more steps" in answer.lower():
+                answer = (
+                    "I could not find this information in the uploaded "
+                    "documents."
+                )
 
             # Extract reasoning steps from messages
             reasoning_steps = []
@@ -239,7 +318,12 @@ Important Instructions:
                 "error": str(e)
             }
 
-    def update_settings(self, temperature: Optional[float] = None, top_k: Optional[int] = None):
+    def update_settings(
+        self,
+        temperature: Optional[float] = None,
+        top_k: Optional[int] = None,
+        relevance_threshold: Optional[float] = None,
+    ):
         """Update agent settings."""
         if temperature is not None:
             self.temperature = temperature
@@ -247,6 +331,9 @@ Important Instructions:
 
         if top_k is not None:
             self.top_k = top_k
+
+        if relevance_threshold is not None:
+            self.relevance_threshold = relevance_threshold
 
     def clear_memory(self):
         """Clear conversation history."""

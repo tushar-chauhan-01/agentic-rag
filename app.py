@@ -17,9 +17,64 @@ import os
 # Load environment variables
 load_dotenv()
 
-from agents import AgenticRAG
-from retriever import retrieve_with_scores
+from agents import AgenticRAG, RELEVANCE_THRESHOLD
+from retriever import retrieve_with_scores, list_documents, delete_document
 from ingestion import ingest_pdf, clear_database
+
+
+# ---------- UI helpers ----------
+
+GUARDRAIL_PHRASES = (
+    "do not contain", "does not contain", "doesn't contain",
+    "no sufficiently relevant", "not contain this information",
+)
+
+
+def is_guardrail_refusal(answer: str) -> bool:
+    """Detect answers where the agent refused because the documents lack the info."""
+    a = answer.lower()
+    return any(p in a for p in GUARDRAIL_PHRASES)
+
+
+def render_answer_badge(answer: str):
+    """Show a guardrail badge under refusals so users understand WHY."""
+    if is_guardrail_refusal(answer):
+        st.info(
+            "🛡️ **Guardrail active** — no document chunk was relevant enough "
+            "(threshold {:.2f}), so the assistant refused instead of guessing "
+            "from its own knowledge.".format(st.session_state.relevance_threshold)
+        )
+
+
+def render_scores(scores, threshold):
+    """Retrieved chunks with relevance bars, colored against the threshold."""
+    st.caption(
+        f"Relevance is normalized 0–1 (higher = better). Chunks below the "
+        f"guardrail threshold ({threshold:.2f}) are not trusted for answers."
+    )
+    for i, (doc, score) in enumerate(scores, 1):
+        passed = score >= threshold
+        icon = "🟢" if passed else "🔴"
+        verdict = "above threshold" if passed else "below threshold"
+        st.markdown(f"{icon} **Chunk {i}** — relevance `{score:.3f}` ({verdict})")
+        st.progress(min(max(score, 0.0), 1.0))
+        st.text(doc[:300] + ("..." if len(doc) > 300 else ""))
+        st.divider()
+
+
+def render_reasoning(steps):
+    """Agent tool calls, with cleaned-up inputs."""
+    tool_icons = {"document_retriever": "🔍", "summarizer": "📝",
+                  "conversation_memory": "💭"}
+    for i, step in enumerate(steps, 1):
+        icon = tool_icons.get(step["tool"], "🔧")
+        # Inputs look like "{'__arg1': 'the query'}" — show just the query
+        raw = step["input"]
+        query = raw.split("'__arg1': ", 1)[-1].strip("{}' ") if "__arg1" in raw else raw
+        st.markdown(f"{icon} **Step {i}: `{step['tool']}`**")
+        st.caption(f"Search query: {query}")
+    if not steps:
+        st.caption("No tools used — the agent answered directly (e.g. chitchat).")
 
 # Page config
 st.set_page_config(
@@ -36,7 +91,7 @@ if "messages" not in st.session_state:
 if "show_reasoning" not in st.session_state:
     st.session_state.show_reasoning = False
 if "show_scores" not in st.session_state:
-    st.session_state.show_scores = False
+    st.session_state.show_scores = True
 if "temperature" not in st.session_state:
     st.session_state.temperature = 0.7
 if "top_k" not in st.session_state:
@@ -45,6 +100,10 @@ if "model" not in st.session_state:
     st.session_state.model = "claude-opus-4-6"
 if "last_uploaded_file" not in st.session_state:
     st.session_state.last_uploaded_file = None
+if "doc_name" not in st.session_state:
+    st.session_state.doc_name = None
+if "relevance_threshold" not in st.session_state:
+    st.session_state.relevance_threshold = RELEVANCE_THRESHOLD
 
 # Title
 st.title("🤖 Agentic RAG Research Copilot")
@@ -57,15 +116,46 @@ with st.sidebar:
     # Document upload section
     st.subheader("📄 Document Management")
 
-    # Check if document is already loaded (directory exists AND has files)
-    import os
-    doc_loaded = os.path.exists("./chroma_db") and len(os.listdir("./chroma_db")) > 0
+    # The vector DB persists across app restarts and can hold MULTIPLE
+    # documents; read what it holds from chunk metadata (written at ingest
+    # time), not from session-scoped state.
+    all_docs = list_documents()
+    selected_docs = []
 
-    if doc_loaded:
-        st.success("✅ Document loaded and ready!")
-        st.info("💡 Upload a new PDF to replace the current document")
+    if all_docs:
+        st.caption(f"📚 {len(all_docs)} document(s) in knowledge base — "
+                   "tick to include in search")
+        for d in all_docs:
+            col_check, col_del = st.columns([5, 1])
+            with col_check:
+                when = (f"Ingested {d['ingested_at']}"
+                        if d.get("ingested_at") else "")
+                checked = st.checkbox(
+                    f"**{d['name']}** — {d['chunks']} chunks",
+                    value=True,
+                    key=f"docsel_{d['name']}",
+                    help=when,
+                )
+            with col_del:
+                if st.button("🗑️", key=f"docdel_{d['name']}",
+                             help=f"Delete {d['name']}"):
+                    delete_document(d["name"])
+                    st.session_state.agent = None
+                    st.rerun()
+            if checked:
+                selected_docs.append(d["name"])
+
+        st.info("💡 Upload another PDF to add it to the knowledge base")
+
+        if st.button("🗑️ Clear All Documents"):
+            clear_database()
+            st.session_state.agent = None
+            st.session_state.messages = []
+            st.session_state.doc_name = None
+            st.session_state.last_uploaded_file = None
+            st.rerun()
     else:
-        st.warning("⚠️ No document loaded")
+        st.warning("⚠️ No documents loaded")
         st.info("👇 Upload a PDF to get started")
 
     uploaded_file = st.file_uploader("Upload PDF", type="pdf")
@@ -88,15 +178,8 @@ with st.sidebar:
                 if st.session_state.agent:
                     st.session_state.agent = None
 
-                st.info("Step 1: Clearing database...")
-                # Clear old database if exists
-                clear_database()
-
-                # Small delay to ensure filesystem operations complete
-                import time
-                time.sleep(1.0)
-
-                st.info(f"Step 2: Ingesting {temp_path}...")
+                st.info(f"Step 1: Ingesting {uploaded_file.name} "
+                        "(added to the knowledge base)...")
                 # Run ingestion in subprocess to avoid Streamlit context issues
                 import subprocess
                 import sys
@@ -107,7 +190,7 @@ with st.sidebar:
                 pdf_path = os.path.abspath(temp_path)
 
                 result = subprocess.run(
-                    [python_path, script_path, pdf_path],
+                    [python_path, script_path, pdf_path, uploaded_file.name],
                     capture_output=True,
                     text=True,
                     timeout=180,  # 3 minutes for ingestion
@@ -118,31 +201,19 @@ with st.sidebar:
                     raise Exception(f"Ingestion failed: {result.stderr}")
                 st.success(f"✅ {result.stdout.strip()}")
 
-                st.info("Step 3: Verifying ingestion...")
-                # Verify database has data
-                import os
-                if os.path.exists("./chroma_db") and len(os.listdir("./chroma_db")) > 0:
-                    st.success(f"✅ Database populated")
+                st.info("Step 2: Verifying ingestion...")
+                if any(d["name"] == uploaded_file.name for d in list_documents()):
+                    st.success(f"📄 Added to knowledge base: {uploaded_file.name}")
                 else:
-                    st.error("❌ Database is empty after ingestion!")
+                    st.error("❌ Document not found in database after ingestion!")
                     st.stop()
-
-                st.success(f"📄 Loaded: {uploaded_file.name}")
-                st.info("💬 You can now start asking questions below!")
 
                 # Mark file as processed
                 st.session_state.last_uploaded_file = uploaded_file.name
+                st.session_state.doc_name = uploaded_file.name
 
-                # Clear old messages (fresh start with new document)
-                st.session_state.messages = []
-
-                # Reinitialize agent with current settings (fresh agent, no old memory)
-                st.session_state.agent = AgenticRAG(
-                    model_name=st.session_state.model,
-                    temperature=st.session_state.temperature,
-                    top_k=st.session_state.top_k,
-                    verbose=False
-                )
+                # Drop the agent so it is rebuilt with the new document scope
+                st.session_state.agent = None
 
                 # Force rerun to update UI
                 st.rerun()
@@ -155,7 +226,7 @@ with st.sidebar:
 
     # Model selection
     st.subheader("🧠 Model Settings")
-    model_options = ["claude-opus-4-6", "claude-sonnet-4-5-20250929", "gpt-4", "gpt-3.5-turbo"]
+    model_options = ["claude-opus-4-6", "claude-sonnet-4-5-20250929", "gpt-4o-mini", "gpt-4", "gpt-3.5-turbo"]
 
     # Find current model index
     try:
@@ -190,20 +261,35 @@ with st.sidebar:
         help="Number of document chunks to retrieve. Higher = more context but potential noise"
     )
 
+    # Guardrail threshold control
+    relevance_threshold = st.slider(
+        "🛡️ Guardrail Threshold",
+        min_value=0.0,
+        max_value=1.0,
+        value=st.session_state.relevance_threshold,
+        step=0.05,
+        help="Minimum retrieval relevance (0-1) required to answer. Below this, "
+             "the assistant says the documents don't contain the information "
+             "instead of guessing. 0 disables the guardrail."
+    )
+
     # Update settings if changed
     if (temperature != st.session_state.temperature or
         top_k != st.session_state.top_k or
+        relevance_threshold != st.session_state.relevance_threshold or
         model_option != st.session_state.model):
 
         st.session_state.temperature = temperature
         st.session_state.top_k = top_k
+        st.session_state.relevance_threshold = relevance_threshold
         st.session_state.model = model_option
 
         # Update agent if it exists
         if st.session_state.agent:
             st.session_state.agent.update_settings(
                 temperature=temperature,
-                top_k=top_k
+                top_k=top_k,
+                relevance_threshold=relevance_threshold
             )
             # If model changed, reinitialize
             if model_option != st.session_state.agent.model_name:
@@ -211,15 +297,18 @@ with st.sidebar:
                     model_name=model_option,
                     temperature=temperature,
                     top_k=top_k,
-                    verbose=False
+                    verbose=False,
+                    relevance_threshold=relevance_threshold
                 )
 
     st.divider()
 
     # Display options
     st.subheader("👁️ Display Options")
-    show_reasoning = st.checkbox("Show Agent Reasoning", value=False)
-    show_scores = st.checkbox("Show Retrieval Scores", value=False)
+    show_reasoning = st.checkbox("Show Agent Reasoning",
+                                 value=st.session_state.show_reasoning)
+    show_scores = st.checkbox("Show Retrieval Scores",
+                              value=st.session_state.show_scores)
 
     st.session_state.show_reasoning = show_reasoning
     st.session_state.show_scores = show_scores
@@ -240,82 +329,77 @@ with st.sidebar:
     st.markdown("""
     **Features:**
     - 🤖 Agentic reasoning with ReAct
-    - 🔍 Multi-tool system
+    - 📚 Multi-document knowledge base
+    - 🛡️ Relevance guardrail (anti-hallucination)
     - 📊 Retrieval transparency
     - 🎛️ Runtime controls
     - 💭 Conversation memory
 
     **Built with:**
-    - LangChain
-    - OpenAI
+    - LangGraph / LangChain
+    - Claude & OpenAI models
     - ChromaDB
     - Streamlit
     """)
 
 # Check if documents are loaded
-import os
-if not os.path.exists("./chroma_db"):
+if not all_docs:
     st.warning("⚠️ No documents loaded yet!")
     st.info("""
     👈 **Get Started:**
     1. Upload a PDF using the sidebar
     2. Wait for ingestion to complete
     3. Start asking questions!
-
-    **Recommended:** Upload "Attention is All You Need" paper for best demo results.
     """)
     st.stop()
 
-# Main chat interface
-# Only initialize agent if database exists
-if os.path.exists("./chroma_db") and os.listdir("./chroma_db"):
-    if not st.session_state.agent:
-        # Initialize agent with default settings
-        try:
-            st.session_state.agent = AgenticRAG(
-                model_name=st.session_state.model,
-                temperature=st.session_state.temperature,
-                top_k=st.session_state.top_k,
-                verbose=False
-            )
-        except Exception as e:
-            st.error(f"Error initializing agent: {str(e)}")
-            st.info("💡 Make sure you have set OPENAI_API_KEY in your .env file")
-            st.stop()
-else:
-    # Clear agent if database doesn't exist
-    st.session_state.agent = None
+if not selected_docs:
+    st.warning("⚠️ No documents selected — tick at least one document "
+               "in the sidebar to search it.")
+    st.stop()
+
+# Main chat interface: (re)build the agent when missing or when the
+# document selection changed since it was created.
+agent = st.session_state.agent
+if agent is None or set(agent.doc_filter or []) != set(selected_docs):
+    try:
+        new_agent = AgenticRAG(
+            model_name=st.session_state.model,
+            temperature=st.session_state.temperature,
+            top_k=st.session_state.top_k,
+            verbose=False,
+            relevance_threshold=st.session_state.relevance_threshold,
+            doc_filter=selected_docs
+        )
+        # Rescoping shouldn't wipe the conversation — carry memory over
+        if agent is not None:
+            new_agent.memory = agent.memory
+        st.session_state.agent = new_agent
+    except Exception as e:
+        st.error(f"Error initializing agent: {str(e)}")
+        st.info("💡 Make sure you have set OPENAI_API_KEY in your .env file")
+        st.stop()
 
 # Display chat messages
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-        # Show reasoning if available and enabled
-        if (message["role"] == "assistant" and
-            "reasoning" in message and
-            st.session_state.show_reasoning and
-            message["reasoning"]):
+        if message["role"] == "assistant":
+            render_answer_badge(message["content"])
 
-            with st.expander("🧠 Agent Reasoning Process", expanded=False):
-                for i, step in enumerate(message["reasoning"], 1):
-                    st.markdown(f"**Step {i}: {step['tool']}**")
-                    st.text(f"Input: {step['input']}")
-                    st.text(f"Output: {step['output']}")
-                    st.divider()
+            # Show reasoning if available and enabled
+            if ("reasoning" in message and st.session_state.show_reasoning
+                    and message["reasoning"] is not None):
+                with st.expander("🧠 Agent Reasoning Process", expanded=False):
+                    render_reasoning(message["reasoning"])
 
-        # Show retrieval scores if available
-        if (message["role"] == "assistant" and
-            "scores" in message and
-            st.session_state.show_scores and
-            message["scores"]):
-
-            with st.expander("📊 Retrieved Documents & Scores", expanded=False):
-                for i, (doc, score) in enumerate(message["scores"], 1):
-                    similarity = f"{score:.3f}"
-                    st.markdown(f"**Document {i}** - Similarity: `{similarity}`")
-                    st.text(doc[:300] + "...")
-                    st.divider()
+            # Show retrieval scores if available
+            if ("scores" in message and st.session_state.show_scores
+                    and message["scores"]):
+                with st.expander("📊 Retrieved Chunks & Relevance", expanded=False):
+                    render_scores(message["scores"],
+                                  st.session_state.relevance_threshold)
 
 # Chat input
 if prompt := st.chat_input("Ask a question about the document..."):
@@ -335,14 +419,21 @@ if prompt := st.chat_input("Ask a question about the document..."):
                 # Display answer
                 answer = result["answer"]
                 st.markdown(answer)
+                render_answer_badge(answer)
 
-                # Get retrieval scores if requested
+                # Get retrieval scores if requested (only when the agent
+                # actually retrieved — chitchat has no scores to show)
+                reasoning_steps = result.get("reasoning_steps", [])
+                did_retrieve = any(
+                    s["tool"] == "document_retriever" for s in reasoning_steps
+                )
                 retrieval_scores = []
-                if st.session_state.show_scores:
+                if st.session_state.show_scores and did_retrieve:
                     try:
                         docs_with_scores = retrieve_with_scores(
                             prompt,
-                            top_k=st.session_state.top_k
+                            top_k=st.session_state.top_k,
+                            doc_names=selected_docs
                         )
                         retrieval_scores = [
                             (doc.page_content, score)
@@ -352,23 +443,15 @@ if prompt := st.chat_input("Ask a question about the document..."):
                         pass
 
                 # Show reasoning
-                reasoning_steps = result.get("reasoning_steps", [])
-                if reasoning_steps and st.session_state.show_reasoning:
+                if st.session_state.show_reasoning:
                     with st.expander("🧠 Agent Reasoning Process", expanded=False):
-                        for i, step in enumerate(reasoning_steps, 1):
-                            st.markdown(f"**Step {i}: {step['tool']}**")
-                            st.text(f"Input: {step['input']}")
-                            st.text(f"Output: {step['output']}")
-                            st.divider()
+                        render_reasoning(reasoning_steps)
 
                 # Show retrieval scores
                 if retrieval_scores and st.session_state.show_scores:
-                    with st.expander("📊 Retrieved Documents & Scores", expanded=False):
-                        for i, (doc, score) in enumerate(retrieval_scores, 1):
-                            similarity = f"{score:.3f}"
-                            st.markdown(f"**Document {i}** - Similarity: `{similarity}`")
-                            st.text(doc[:300] + "...")
-                            st.divider()
+                    with st.expander("📊 Retrieved Chunks & Relevance", expanded=False):
+                        render_scores(retrieval_scores,
+                                      st.session_state.relevance_threshold)
 
                 # Add to messages
                 st.session_state.messages.append({
@@ -390,4 +473,10 @@ if prompt := st.chat_input("Ask a question about the document..."):
 
 # Footer
 st.divider()
-st.caption(f"🔧 Model: {st.session_state.model} | 🌡️ Temperature: {st.session_state.temperature} | 🔍 Top-k: {st.session_state.top_k}")
+st.caption(
+    f"🔧 Model: {st.session_state.model} | "
+    f"🌡️ Temperature: {st.session_state.temperature} | "
+    f"🔍 Top-k: {st.session_state.top_k} | "
+    f"🛡️ Guardrail: {st.session_state.relevance_threshold:.2f} | "
+    f"📚 Searching {len(selected_docs)}/{len(all_docs)} document(s)"
+)

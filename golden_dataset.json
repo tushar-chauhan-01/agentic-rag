@@ -1,0 +1,73 @@
+{
+  "document": "BMW_Guide.pdf",
+  "description": "Golden evaluation dataset for the BMW X1 Specification Guide (AU, Oct 2021). 'answerable' questions have ground truth in the document; 'unanswerable' questions do NOT and are used to calibrate the retrieval relevance threshold (guardrail).",
+  "answerable": [
+    {
+      "question": "What is the 0-100 km/h acceleration time of the sDrive20i?",
+      "gold_answer_contains": "7.6",
+      "gold_chunk_keyword": "7.6 sec"
+    },
+    {
+      "question": "How many cylinders does the sDrive18i engine have?",
+      "gold_answer_contains": "3",
+      "gold_chunk_keyword": "3-Cylinder"
+    },
+    {
+      "question": "What is the fuel consumption of the sDrive18d?",
+      "gold_answer_contains": "5.3",
+      "gold_chunk_keyword": "5.3 l / 100km"
+    },
+    {
+      "question": "What transmission does the sDrive18d use?",
+      "gold_answer_contains": "8-speed",
+      "gold_chunk_keyword": "8-speed automatic"
+    },
+    {
+      "question": "What is the model code of the sDrive18d?",
+      "gold_answer_contains": "52AC",
+      "gold_chunk_keyword": "Model Code: 52AC"
+    },
+    {
+      "question": "How much torque does the sDrive18d produce?",
+      "gold_answer_contains": "330",
+      "gold_chunk_keyword": "330Nm"
+    },
+    {
+      "question": "How many speakers does the standard stereo system have?",
+      "gold_answer_contains": "6",
+      "gold_chunk_keyword": "100W, with 6 loudspeakers"
+    },
+    {
+      "question": "What does the harman/kardon loudspeaker system include?",
+      "gold_answer_contains": "12 speakers",
+      "gold_chunk_keyword": "12 speakers and 360W"
+    },
+    {
+      "question": "What colour are the callipers on the M Sport Brakes?",
+      "gold_answer_contains": "Blue",
+      "gold_chunk_keyword": "Blue callipers"
+    },
+    {
+      "question": "What split do the foldable rear seats have?",
+      "gold_answer_contains": "40:20:40",
+      "gold_chunk_keyword": "40:20:40"
+    },
+    {
+      "question": "What features are included in the Enhancement Package?",
+      "gold_answer_contains": "Panorama",
+      "gold_chunk_keyword": "Panorama glass sunroof"
+    },
+    {
+      "question": "What size is the Navigation System Plus display?",
+      "gold_answer_contains": "10.25",
+      "gold_chunk_keyword": "10.25"
+    }
+  ],
+  "unanswerable": [
+    { "question": "What is the capital of France?" },
+    { "question": "How do I bake a chocolate cake?" },
+    { "question": "Who won the 2018 FIFA World Cup?" },
+    { "question": "What is the price of a Tesla Model 3?" },
+    { "question": "Explain how photosynthesis works." }
+  ]
+}

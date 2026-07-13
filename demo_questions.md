@@ -1,114 +1,156 @@
-# Demo Questions for "Attention is All You Need"
+# Demo Script — BMW X1 Specification Guide
+
+> Demo document: `BMW_Guide.pdf` (BMW X1 spec guide, AU, Oct 2021).
+> Why this corpus: the specs are **not** in any LLM's training data in this exact form,
+> so correct answers *prove* retrieval works — and guardrails matter.
+> (Legacy Transformer-paper questions at the bottom.)
 
 ## Quick Demo Questions (30-second demo)
 
 ### 1. Basic Retrieval
-**Question:** "What is the main contribution of this paper?"
-**Expected:** Should retrieve abstract/introduction and summarize the Transformer architecture
+**Question:** "How much torque does the sDrive18d produce?"
+**Expected:** "330 Nm" — retrieved from the model overview page
 
-### 2. Technical Detail
-**Question:** "Explain the scaled dot-product attention mechanism"
-**Expected:** Should retrieve the specific section with formula and explanation
+### 2. Specific Spec
+**Question:** "What is the 0-100 km/h time of the sDrive20i?"
+**Expected:** "7.6 seconds" — exact figure from the spec table
 
-### 3. Comparison
-**Question:** "How does the Transformer architecture differ from RNN-based models?"
-**Expected:** Should retrieve multiple sections comparing architectures
+### 3. Equipment Question
+**Question:** "What split do the foldable rear seats have?"
+**Expected:** "40:20:40" — from standard equipment list
 
-## Impressive Demo Questions (Show off capabilities)
+## Impressive Demo Questions
 
-### 4. Summarization
-**Question:** "Summarize the key innovations of the Transformer in 3 bullet points"
-**Expected:** Agent should use summarization tool, synthesize multiple sections
+### 4. Package Contents
+**Question:** "What features are included in the Enhancement Package?"
+**Expected:** Metallic paint + panorama glass sunroof (+ 19" wheels)
 
-### 5. Specific Results
-**Question:** "What were the BLEU scores on the WMT 2014 English-to-German translation task?"
-**Expected:** Should retrieve exact numbers from results section
+### 5. Trim Detail
+**Question:** "What colour are the callipers on the M Sport Brakes?"
+**Expected:** "Blue" (red available on request) — buried in the M Sport Plus Package section
 
-### 6. Architecture Details
-**Question:** "Describe the multi-head attention mechanism"
-**Expected:** Should retrieve technical details with formula
+### 6. Model Codes
+**Question:** "What is the model code of the sDrive18d?"
+**Expected:** "52AC" — exact-identifier retrieval
 
-### 7. Training Details
-**Question:** "What optimizer and learning rate schedule did they use?"
-**Expected:** Should find specific training hyperparameters
+### 7. Follow-up (Tests Memory)
+**First:** "What engine does the sDrive18i have?"
+**Then:** "And how fast does it get to 100?"
+**Expected:** Second answer resolves "it" via conversation memory → 9.6 sec
 
-## Questions to Show Agentic Behavior
+## 🛡️ Guardrail Demo (the differentiator)
 
-### 8. Multi-Step Reasoning
-**Question:** "Why is self-attention better than recurrence? Give me the computational advantages."
-**Expected:** Agent retrieves → evaluates → retrieves more specific info → synthesizes
+Ask these with the BMW guide loaded:
 
-### 9. Comparison Question
-**Question:** "Compare the model size and training time of the Transformer to previous models"
-**Expected:** Agent should retrieve from multiple sections and compare
+### 8. Off-topic Fact
+**Question:** "What is the capital of France?"
+**Expected:** *"The uploaded documents do not contain this information"* — NOT "Paris"!
+**Why it matters:** the model obviously *knows* Paris. Refusing proves answers are
+grounded in the document, not parametric memory.
 
-### 10. Follow-up Question (Tests Memory)
-**First:** "What is positional encoding?"
-**Then:** "Why is it necessary in the Transformer?"
-**Expected:** Agent remembers context from previous question
+### 9. Adversarially Close Off-topic
+**Question:** "What is the price of a Tesla Model 3?"
+**Expected:** Refusal. This one is hard — car-adjacent wording retrieves BMW chunks
+with relevance 0.68, nearly indistinguishable from real questions. The retrieval
+threshold alone can't block it; the document-only system prompt catches it.
+**Talking point:** defense in depth — two layers because each one alone is bypassable.
+
+### 10. Explain the Mechanism
+Point at `agents.py`: if no chunk scores ≥ 0.65 relevance, the retriever tool refuses
+to feed the LLM context; the agent may retry once with different wording, then must
+tell the user. Threshold calibrated with `evaluate.py`: answerable questions scored
+0.664–0.858, off-topic 0.597–0.683.
+
+## 📏 Evaluation Demo
+
+```bash
+python evaluate.py                 # retrieval eval — seconds, no LLM cost
+python evaluate.py --generation    # full scorecard — ~2 min
+```
+
+Show the scorecard and explain each metric:
+
+- **Recall@5 = 100%** — every golden question's answer chunk is retrieved
+- **Correctness = 100%** (12/12) — substring check against gold facts
+- **Faithfulness = 100%** (12/12) — LLM-as-judge: every claim supported by retrieved context
+- **Refusal rate = 100%** (5/5) — all off-topic questions correctly refused
+
+**Talking point:** "Every change I made — chunk size, threshold, prompt — was
+validated against this golden dataset. That's the difference between tweaking
+vibes and engineering."
+
+## 📚 Multi-Document Demo
+
+Load **both** BMW_Guide.pdf and Attention_is_all_you_need.pdf, then:
+
+1. **Scoped refusal:** tick ONLY BMW_Guide.pdf and ask *"How many attention heads
+   does the model use?"* → refused (best BMW relevance 0.635, below the 0.65
+   threshold). Tick the paper → answered ("8"). Same question, different scope,
+   guardrail composes with document filtering.
+2. **Cross-domain isolation:** with both ticked, ask a BMW question and show the
+   retrieved chunks all come from BMW_Guide.pdf — metadata filters + relevance
+   ranking keep domains from contaminating each other.
+3. **Talking point:** "Retrieval is scoped with a `doc_name` metadata filter —
+   the same mechanism production systems use for multi-tenant isolation, just
+   with tenant_id from the JWT instead of a sidebar checkbox."
 
 ## Questions to Demonstrate Controls
 
 ### Temperature Demo
-Ask same question at different temperatures:
-- **Temperature 0.0:** "Explain attention mechanism" → Factual, precise
-- **Temperature 0.7:** "Explain attention mechanism" → More creative, verbose
+Same question at 0.0 vs 0.7: "Describe the M Sport Package" → precise list vs chattier prose
 
 ### Top-k Demo
-Ask same question with different top-k:
-- **k=1:** "What is the Transformer?" → Minimal context
-- **k=5:** "What is the Transformer?" → Rich context
+- **k=1:** "What does the Comfort Package include?" → may miss items
+- **k=5:** same question → complete list
+
+### Retrieval Scores
+Enable "Show Retrieval Scores": scores are relevance normalized to 0–1, higher = better.
+"0.85 means high confidence; below our 0.65 threshold the system refuses to answer."
 
 ## Recruiter-Friendly Explanations
 
-When showing the demo, explain:
+1. **Grounding**: "Ask it the capital of France — it refuses. Every answer is provably from the document."
+2. **Agent Reasoning**: "The agent *decides* to retrieve; for 'thanks!' it skips retrieval entirely — cheaper and faster than fixed-pipeline RAG"
+3. **Chunking**: "800 characters with 150 overlap so facts don't get split across chunk boundaries"
+4. **Calibration**: "The refusal threshold isn't a guess — I measured relevance-score distributions for answerable vs off-topic questions and set it between them"
+5. **Evaluation**: "12 golden questions + 5 off-topic traps, scored on recall, correctness, faithfulness, and refusal rate"
 
-1. **Retrieval Scores**: "Notice the similarity scores - 0.85 is high confidence, showing the system found relevant content"
-
-2. **Agent Reasoning**: "The agent decided to retrieve because this is a knowledge question, not something it can answer from memory"
-
-3. **Chunking Strategy**: "I chunked the paper into 800-token segments with 150-token overlap to maintain context"
-
-4. **Temperature Control**: "Temperature controls randomness - lower values give more deterministic, factual answers"
-
-5. **Top-k Tradeoff**: "Top-k is precision vs recall - too low misses context, too high adds noise"
-
-## Failure Cases to Show (Demonstrates Understanding)
-
-### When RAG Fails
-**Question:** "What do you think about the Transformer's impact on modern AI?"
-**Expected:** Should acknowledge this requires opinion, not just retrieval
-
-### Out of Scope
-**Question:** "How does BERT use Transformers?"
-**Expected:** Should say "not in the document" (BERT came later)
-
-## Quick Demo Script (1 minute)
+## Quick Demo Script (2 minutes)
 
 ```
-1. Upload "attention_is_all_you_need.pdf"
-2. Show ingestion success
-3. Ask: "What is the main contribution?"
-4. Point out:
-   - Agent reasoning
-   - Retrieved chunks with scores
-   - Synthesized answer
-5. Adjust temperature slider
-6. Ask same question - show difference
-7. Show "Retrieved Context" section
-8. Ask follow-up: "How does multi-head attention work?"
-9. Show memory working
+1. Upload BMW_Guide.pdf → show ingestion success
+2. Ask: "How much torque does the sDrive18d produce?" → 330 Nm
+3. Enable "Show Retrieval Scores" → point at relevance ~0.8
+4. Ask: "What is the capital of France?" → refusal (the wow moment)
+5. Explain the two guardrail layers (threshold + document-only prompt)
+6. Terminal: python evaluate.py → show 100% recall + calibration ranges
+7. Close: "every design decision here was measured, not guessed"
 ```
 
 ## Technical Talking Points
 
-- "I used OpenAI embeddings for semantic search"
-- "ChromaDB for vector storage with persistence"
-- "LangChain ReAct agent for agentic reasoning"
-- "Chunk size optimized for this domain (800 tokens)"
-- "Temperature and top-k exposed for runtime control"
-- "Retrieval scores provide transparency"
+- "OpenAI embeddings + ChromaDB for semantic search, LangGraph ReAct agent on top"
+- "Normalized relevance scores (0–1) — I actually fixed a bug where raw distances were displayed as similarities"
+- "Relevance-threshold guardrail, calibrated from measured score distributions"
+- "Two-layer hallucination defense: tool-level threshold + document-only system prompt"
+- "Golden-dataset eval harness: recall@5, correctness, LLM-judged faithfulness, refusal rate"
+- "Found and fixed a real guardrail bypass: the agent answered 'Paris' without calling the retriever until the prompt forced retrieval for all factual questions"
+- "Best bug of the project: the retriever tool truncated chunks to 300 chars, so the agent retrieved the right chunk but couldn't see the answer inside it — fixing one line took correctness from 75% to 100%"
 
 ---
 
-**Pro Tip:** Practice the demo 2-3 times so you can explain smoothly while showing the UI.
+## Legacy: "Attention is All You Need" Questions
+
+If demoing with the Transformer paper instead:
+
+1. "What is the main contribution of this paper?" — abstract retrieval
+2. "What were the BLEU scores on WMT 2014 English-to-German?" — exact figures (28.4)
+3. "What optimizer and learning rate schedule did they use?" — Adam, custom warmup schedule
+4. "Explain the scaled dot-product attention mechanism" — formula section
+5. Follow-up pair: "What is positional encoding?" → "Why is it necessary?" — memory demo
+
+---
+
+**Pro Tip:** Practice the demo 2-3 times. Lead with a correct BMW answer, then the
+France refusal — the contrast between "knows the document" and "refuses what it
+can't verify" is the strongest 20 seconds of the demo.

@@ -48,12 +48,27 @@ def clear_database():
         import shutil
         shutil.rmtree(persist_dir)
 
+    # ChromaDB caches clients per path within a process; a cached client
+    # keeps an open handle to the now-deleted SQLite file and would keep
+    # serving stale data. Flush it so the next connection sees fresh files.
+    try:
+        import chromadb
+        chromadb.api.client.SharedSystemClient.clear_system_cache()
+    except Exception:
+        pass
+
     # Recreate with proper permissions
     os.makedirs(persist_dir, mode=0o777, exist_ok=True)
     os.chmod(persist_dir, 0o777)
 
 
-def ingest_pdf(pdf_path):
+def ingest_pdf(pdf_path, doc_name=None):
+    """Ingest a PDF into ChromaDB.
+
+    doc_name: display name stored in chunk metadata (defaults to the file's
+    basename). Lets the UI show the real uploaded filename even when the
+    PDF arrives via a temp file.
+    """
     # Try to load the PDF; if parsing problems occur, attempt a simple
     # sanitization by rewriting the PDF with PyPDF2 and reloading.
     loader = PyPDFLoader(pdf_path)
@@ -84,6 +99,16 @@ def ingest_pdf(pdf_path):
 
     chunks = text_splitter.split_documents(documents)
 
+    # Stamp provenance metadata on every chunk so the knowledge base is
+    # self-describing: the UI reads these back to show what is loaded,
+    # since the vector DB outlives any app session.
+    from datetime import datetime
+    display_name = doc_name or os.path.basename(pdf_path)
+    ingested_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    for chunk in chunks:
+        chunk.metadata["doc_name"] = display_name
+        chunk.metadata["ingested_at"] = ingested_at
+
     # Ensure OPENAI_API_KEY is available
     if not os.environ.get("OPENAI_API_KEY"):
         raise RuntimeError(
@@ -101,6 +126,18 @@ def ingest_pdf(pdf_path):
     persist_dir = os.path.join(repo_root, "chroma_db")
     os.makedirs(persist_dir, mode=0o777, exist_ok=True)
     os.chmod(persist_dir, 0o777)
+
+    # Multi-document store: ingestion APPENDS to the collection. Re-uploading
+    # a document with the same name replaces it (delete old chunks first)
+    # instead of duplicating its content.
+    try:
+        existing = Chroma(
+            persist_directory=persist_dir, embedding_function=embeddings
+        )
+        existing._collection.delete(where={"doc_name": display_name})
+        del existing
+    except Exception:
+        pass
 
     # Simple ingestion without custom client (works in subprocess)
     vectorstore = Chroma.from_documents(

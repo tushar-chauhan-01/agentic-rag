@@ -33,12 +33,14 @@ An **Agentic RAG Research Copilot**: upload a PDF, then chat with it. Instead of
 
 | File | Role |
 |---|---|
-| `app.py` | Streamlit UI — upload, settings (model/temperature/top-k), chat loop |
-| `agents.py` | `AgenticRAG` class — LangGraph ReAct agent + 3 tools |
-| `ingestion.py` | PDF → text → chunks → embeddings → ChromaDB |
+| `app.py` | Streamlit UI — document manager (multi-doc), settings (model/temperature/top-k/guardrail), chat loop |
+| `agents.py` | `AgenticRAG` class — LangGraph ReAct agent + 3 tools + retrieval guardrail |
+| `ingestion.py` | PDF → text → chunks (+ provenance metadata) → embeddings → ChromaDB (append) |
 | `ingest_wrapper.py` | Subprocess entry point for ingestion (critical fix, see §10) |
-| `retriever.py` | Vector search, with and without similarity scores |
+| `retriever.py` | Vector search with normalized relevance scores, doc-scoped filters, document listing/deletion |
 | `memory.py` | In-memory conversation history + keyword search over it |
+| `evaluate.py` | Two-stage eval harness — retrieval recall + LLM-judged generation quality (§10.4) |
+| `golden_dataset.json` | Golden Q&A set (BMW X1 guide) + off-topic questions for guardrail calibration |
 
 ### High-Level Architecture
 
@@ -239,7 +241,7 @@ flowchart TB
 ### ChromaDB in This Project
 
 - **Embedded mode**: runs in-process, persists to `./chroma_db/` (SQLite for metadata + HNSW index files). No server to operate — perfect for a POC, a known liability for production (single-writer SQLite, no multi-process concurrency, no replication — see §10 for the bug this caused).
-- Each record = **vector + original text + metadata** (source file, page). Metadata enables **filtered retrieval** (`where={"source": "manual.pdf"}`) — essential for multi-tenant or multi-document setups, *not used in this POC* (a real limitation: all uploaded docs share one collection, hence the "clear DB on every upload" design).
+- Each record = **vector + original text + metadata** (source file, page, plus this repo's `doc_name` and `ingested_at` stamps). Metadata enables **filtered retrieval** — *used in this repo* for multi-document support: the sidebar's document checkboxes become a `where={"doc_name": {"$in": [...]}}` filter on every search. The same mechanism scaled up (with `tenant_id` from a JWT instead of a checkbox) is how production systems do multi-tenant isolation.
 
 ### The Landscape (know 2–3 for interviews)
 
@@ -388,7 +390,7 @@ flowchart LR
 - It's **in-process and per-session** — dies on restart, can't scale across replicas. Production: Redis or Postgres-backed history keyed by `(user_id, session_id)`, or LangGraph checkpointers.
 - Keyword search misses paraphrases ("the car manual" won't match "BMW guide") — production uses embedding search over history too.
 - Unbounded history → context overflow on long sessions. Production: sliding window + periodic **LLM summarization** of older turns ("running summary" pattern).
-- **Cross-document contamination**: this repo clears chat on each upload precisely because stale memory about document A poisons answers about document B.
+- **Cross-document contamination**: the single-document version of this repo cleared chat on every upload because stale memory about document A poisoned answers about document B. The multi-document version keeps history and instead **scopes retrieval** with metadata filters — contamination control moved from wiping state to filtering search.
 
 ---
 
@@ -427,7 +429,27 @@ A fresh process = fresh SQLite connection, no inherited locks, OS-guaranteed cle
 
 ### 10.3 Memory Contamination
 
-Uploading a new PDF while keeping old chat history meant the agent's memory still "knew" things about the previous document and would blend them into answers. **Fix:** clear messages and rebuild the agent on every upload. **General principle:** retrieval scope and conversation scope must be invalidated *together*.
+Uploading a new PDF while keeping old chat history meant the agent's memory still "knew" things about the previous document and would blend them into answers. **Fix (v1, single-document era):** clear messages and rebuild the agent on every upload. **Fix (v2, multi-document era):** uploads *add* to the knowledge base instead of replacing it, retrieval is scoped by `doc_name` metadata filters, and history survives — contamination control moved from wiping state to filtering search. **General principle:** retrieval scope and conversation scope must stay consistent with each other; you either invalidate them together or scope them together.
+
+### 10.4 The Guardrail Bypass — and Real Eval Numbers
+
+This repo now has a working evaluation harness (`evaluate.py` + `golden_dataset.json`, built on the BMW X1 spec guide) and a two-layer anti-hallucination guardrail. Building them surfaced three lessons worth telling:
+
+**Lesson 1 — a guardrail inside a tool the agent can skip is no guardrail.**
+The first guardrail was a relevance threshold *inside* the retriever tool: if no chunk scored ≥ 0.65, return "not found" instead of feeding the LLM noise. Then a probe asked *"What is the capital of France?"* — and the agent answered **"Paris" with zero tool calls**. It decided the question wasn't "about documents," never invoked the retriever, and answered from parametric memory. The threshold never got a chance to fire. **Fix:** a second layer — the system prompt now forbids answering any factual question without retrieval. Defense in depth isn't optional in agentic systems: every layer must assume the others can be bypassed.
+
+**Lesson 2 — calibrate thresholds from measured distributions, not vibes.**
+`evaluate.py` measured best-chunk relevance scores on the BMW corpus: answerable questions scored **0.664–0.858**, off-topic questions **0.597–0.683**. The distributions *overlap* — "What is the price of a Tesla Model 3?" (0.683) outscored two legitimate BMW questions, because car-adjacent vocabulary is genuinely close in embedding space. No threshold separates them perfectly; 0.65 was chosen to keep all answerable questions while blocking 4/5 off-topic ones, letting the prompt layer catch the rest. Measured results: recall@5 = **100%**, off-topic refusal = **100%** (5/5, including Tesla — caught by the prompt layer).
+
+**Lesson 3 — the guardrail evaluates the agent's query, not the user's.**
+Two borderline questions were refused even though their *original* phrasing scored above threshold: the ReAct agent **rewrites the query** before calling the tool, and the rewrite embedded lower. Threshold calibration done on raw user questions understates the real recall cost. **Fixes:** (a) when the rewrite fails the threshold, the tool falls back to scoring the *original* user question before refusing; (b) the retry invitation is enforced by a **deterministic counter** in the tool (first sub-threshold hit → "retry once"; second → hard stop) rather than trusting the model to obey an instruction — weaker models happily loop past "retry ONCE", which also motivated a `recursion_limit` cap on the agent loop.
+
+**Lesson 4 — the failure that looked like everything else: tool output truncation.**
+After all the guardrail work, three answerable questions still failed. Eval traces showed the agent retrieving the *correct chunk*, then re-searching in circles until the recursion cap. Root cause: the retriever tool did `doc.page_content[:300]` — chunks are 800 characters, so the tool silently threw away 60% of every retrieved chunk, and these three facts ("6 loudspeakers", "Blue callipers") sat past the cutoff. The model retrieved the answer and *couldn't see it*. One deleted slice → correctness went **9/12 → 12/12**. Moral: in agentic RAG the tool-result formatting is part of the retrieval pipeline; debugging requires looking at *exactly what text the LLM received*, not what the vector store returned.
+
+**Final measured results** (BMW X1 guide, gpt-4o-mini agent): recall@5 **100%**, correctness **12/12**, faithfulness **12/12**, off-topic refusal **5/5** — including the adversarial Tesla question, which passes the retrieval threshold (car-adjacent, 0.68) but gets caught by the generation layer.
+
+**The flywheel in action:** score bug fixed → normalized scores made a threshold possible → eval calibrated it → probe found the prompt bypass → eval exposed the rewrite variance → traces exposed the truncation bug. Six changes, every one measured, not guessed. That loop *is* "evaluating and guardrailing RAG."
 
 ---
 
@@ -461,6 +483,8 @@ The section to drill before interviews. Format: question → the answer a senior
 > 3. **Citations**: force the model to cite chunk IDs; uncited claims are flagged or dropped. Citations also let users verify.
 > 4. **Eval-time faithfulness metrics** (RAGAS faithfulness / LLM-as-judge): measure whether each answer claim is supported by retrieved context, and track it as a release gate.
 > 5. Low temperature for factual Q&A.
+>
+> *Implemented in this repo:* layers 1 and 2 — see §10.4 for the measured results and the bypass that made layer 1 insufficient on its own.
 
 ### Q4. "User asks: 'Summarize the whole document.' What breaks?"
 
@@ -509,6 +533,8 @@ The section to drill before interviews. Format: question → the answer a senior
 > - **Generation metrics**: faithfulness (is every claim supported by the retrieved context?), answer relevance, citation correctness — typically LLM-as-judge (e.g., RAGAS framework).
 > - **Online**: thumbs up/down, "I don't know" rate, deflection rate, retrieved-score distributions drifting over time.
 > The non-negotiable: a **versioned eval dataset** built from real user queries, run in CI, so "we changed the chunk size" is a measured decision, not vibes. Every production "wrong answer" ticket becomes a new eval case.
+>
+> *Implemented in this repo:* `evaluate.py` + `golden_dataset.json` — recall@5, correctness, LLM-judged faithfulness, and refusal rate, measured on the BMW X1 guide (§10.4 has the numbers).
 
 ### Q13. "Embedding/vector store scaling — what breaks first?"
 
@@ -534,11 +560,11 @@ How to evolve this POC into something a company can run. (This matches the plann
 | Streamlit monolith | UI, API and compute in one process; no horizontal scale | **FastAPI** backend + separate frontend (React/Next.js) |
 | `subprocess.run` ingestion, 180 s timeout | Blocks a web worker; no retries, no queue, one file at a time | **Celery + Redis/RabbitMQ** async workers |
 | Embedded ChromaDB (SQLite) | Single-writer, no concurrency, no backups/HA, the readonly bug | **pgvector** (or Qdrant at scale) |
-| One global collection, DB wiped per upload | One document at a time, no users | Multi-doc, **multi-tenant** collections with metadata filters |
+| Multi-doc via metadata filters (`doc_name`) — implemented | Single-user; no ACLs on who may see which document | Same pattern scaled: **multi-tenant** filters from the JWT, doc-level ACLs synced from source systems |
 | In-process memory | Lost on restart, can't scale past 1 replica | **Redis/Postgres-backed** session store |
 | API keys in `.env` | Leak risk, no rotation | Secrets manager (Vault, AWS Secrets Manager) |
 | No auth | Anyone can query anything | OAuth2/OIDC + per-tenant authorization on retrieval |
-| No evals, no tracing | Quality regressions ship silently | Eval suite in CI + **LangSmith/Langfuse** tracing |
+| Manual eval runs (`evaluate.py`), no tracing | Quality regressions ship silently | Same eval suite wired into CI as a deploy gate + **LangSmith/Langfuse** tracing |
 
 ### 12.2 Target Architecture
 
